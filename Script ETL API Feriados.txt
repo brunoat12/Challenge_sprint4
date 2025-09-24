@@ -1,0 +1,38 @@
+import sys
+import requests
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from pyspark.sql import Row
+from pyspark.sql.functions import col
+
+args = getResolvedOptions(sys.argv, [])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+bucket = "challenge-cognitio"
+prefix = "feriados-brasil/2018-2024"
+
+def fetch_feriados_ano(ano):
+    url = f"https://brasilapi.com.br/api/feriados/v1/{ano}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Erro API {ano}: {response.status_code}")
+    return response.json()
+
+df_total = None
+for ano in range(2018, 2025):
+    dados_ano = fetch_feriados_ano(ano)
+    rows = [Row(**feriado) for feriado in dados_ano]
+    df_ano = spark.createDataFrame(rows).withColumn("date", col("date").cast("date"))
+    if df_total is None:
+        df_total = df_ano
+    else:
+        df_total = df_total.unionByName(df_ano)
+
+output_path = f"s3://challenge-cognitio/Dados_API_Eventos/"
+df_total.write.mode("overwrite").parquet(output_path)
+
+print(f"Dados de feriados salvos em: {output_path}")

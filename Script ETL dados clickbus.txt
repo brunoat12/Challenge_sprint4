@@ -1,0 +1,111 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from awsglue.dynamicframe import DynamicFrame
+
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Carregar dados brutos do catálogo Glue
+tratamento_hashes = glueContext.create_dynamic_frame.from_catalog(
+    database="db_cognitio_clickbus",
+    table_name="df_t_csv",
+    transformation_ctx="tratamento_hashes"
+)
+df = tratamento_hashes.toDF()
+
+# --- Ler arquivo mapeamento hash->cidade do S3 usando Spark direto, com separador ';' ---
+mapping_path = "s3://challenge-cognitio/Dados_bruto/Hash_cidade.csv"  # ajuste o caminho
+
+df_mapping = spark.read.option("header", True).option("sep", ";").csv(mapping_path)
+
+# Debug: verificar colunas e schema
+df_mapping.printSchema()
+print("Colunas do mapeamento:", df_mapping.columns)
+df_mapping.show(5)
+
+# Renomear colunas para padrão esperado
+df_mapping = df_mapping.withColumnRenamed("Hash", "hash").withColumnRenamed("Nome_cidade", "cidade")
+
+# Função para substituir hash por nome de cidade; recebe df_mapping renomeado como argumento
+def substituir_hash_por_cidade(df, coluna_hash, coluna_saida, df_map):
+    df_join = df.join(df_map, df[coluna_hash] == df_map["hash"], "left")
+    df_join = df_join.drop(coluna_hash, "hash").withColumnRenamed("cidade", coluna_saida)
+    df_join = df_join.withColumn(
+        coluna_saida,
+        F.coalesce(F.col(coluna_saida), F.lit("cidade_desconhecida"))
+    )
+    return df_join
+
+# Aplicar substituição para cada coluna hash de cidade
+df = substituir_hash_por_cidade(df, "place_origin_departure", "place_origin_departure_nome", df_mapping)
+df = substituir_hash_por_cidade(df, "place_origin_return", "place_origin_return_nome", df_mapping)
+df = substituir_hash_por_cidade(df, "place_destination_departure", "place_destination_departure_nome", df_mapping)
+df = substituir_hash_por_cidade(df, "place_destination_return", "place_destination_return_nome", df_mapping)
+
+# Remover colunas originais de hash e renomear as novas para nomes legíveis
+df = df.drop("place_origin_departure", "place_origin_return", "place_destination_departure", "place_destination_return")
+df = df.withColumnRenamed("place_origin_departure_nome", "Origem_viagem_ida")
+df = df.withColumnRenamed("place_origin_return_nome", "Origem_viagem_retorno")
+df = df.withColumnRenamed("place_destination_departure_nome", "Destino_viagem_ida")
+df = df.withColumnRenamed("place_destination_return_nome", "Destino_viagem_retorno")
+
+# Função para mapear e renomear informações únicas
+def renomear_dados(df, coluna_atual, nova_coluna, prefix=None):
+    dados_unicos = df.select(coluna_atual).distinct()
+    window = Window.orderBy(coluna_atual)
+    if prefix:
+        dados_unicos = dados_unicos.withColumn(
+            nova_coluna,
+            F.concat(F.lit(prefix + " "), F.row_number().over(window).cast("string"))
+        )
+    else:
+        dados_unicos = dados_unicos.withColumn(nova_coluna, F.row_number().over(window))
+    dados_unicos_renomeados = df.join(dados_unicos, on=coluna_atual, how='left')
+    return dados_unicos_renomeados
+
+# Criar colunas ajustadas
+df = renomear_dados(df, 'nk_ota_localizer_id', 'id_compra')
+df = renomear_dados(df, 'fk_contact', 'id_cliente')
+df = renomear_dados(df, 'fk_departure_ota_bus_company', 'Viacao_ida', prefix='viacao_ida')
+df = renomear_dados(df, 'fk_return_ota_bus_company', 'Viacao_retorno', prefix='viacao_retorno')
+
+df = df.withColumn('Viacao_retorno',
+                   F.when(F.col('fk_return_ota_bus_company') == '1', 'Sem retorno')
+                   .otherwise(F.col('Viacao_retorno')))
+
+# Colunas para dropar
+colunas_dropar = [
+    'nk_ota_localizer_id',
+    'fk_contact',
+    'place_origin_departure',
+    'place_origin_return',
+    'place_destination_return',
+    'fk_departure_ota_bus_company',
+    'fk_return_ota_bus_company',
+    'place_destination_departure'
+]
+df = df.drop(*colunas_dropar)
+
+# Converter para DynamicFrame para salvar
+df_final = DynamicFrame.fromDF(df, glueContext, 'dados_transformados')
+
+glueContext.write_dynamic_frame.from_options(
+    frame=df_final,
+    connection_type='s3',
+    connection_options={'path': 's3://challenge-cognitio/processed/'},
+    format='parquet'
+)
+
+job.commit()

@@ -1,0 +1,505 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, confusion_matrix, precision_score, recall_score, f1_score
+from sklearn.preprocessing import LabelEncoder
+import awswrangler as wr
+from datetime import datetime, timedelta
+
+class PrevisaoComprasClientes:
+    def __init__(self, bucket_s3: str, database: str = "db_cognitio_clickbus", data_referencia: str = "2024-04-02"):
+        self.bucket_s3 = bucket_s3
+        self.database = database
+        self.data_referencia = pd.to_datetime(data_referencia)
+        self.df = None
+        self.feriados_df = None
+        self.features_df = None
+        self.clf = None
+        self.metricas_treino = {}
+        self.metricas_validacao_temporal = {}
+        self.janela_dias = 30
+    
+    def carregar_dados(self):
+        # Carregar dados de viagens
+        query_viagens = """
+        SELECT *
+        FROM tb_viagens_clickbusprocessed
+        WHERE CAST(date_purchase AS date) >= DATE '2022-01-01'
+        AND CAST(date_purchase AS date) <= DATE '2024-04-01'
+        """
+        self.df = wr.athena.read_sql_query(
+            sql=query_viagens,
+            database=self.database,
+            s3_output=f"s3://{self.bucket_s3}/temp-query/",
+            ctas_approach=False
+        )
+        
+        # Carregar dados de feriados
+        query_feriados = "SELECT date, name, type FROM tb_feriados_brasildados_api_eventos"
+        self.feriados_df = wr.athena.read_sql_query(
+            sql=query_feriados,
+            database=self.database,
+            s3_output=f"s3://{self.bucket_s3}/temp-query/",
+            ctas_approach=False
+        )
+        
+        print(f"Dados carregados: {len(self.df)} registros de viagens, {len(self.feriados_df)} feriados")
+    
+    def preprocessar(self):
+        self.df['date_purchase'] = pd.to_datetime(self.df['date_purchase'])
+        self.df = self.df.sort_values(['id_cliente', 'date_purchase'])
+        
+        # Processar feriados
+        self.feriados_df['date'] = pd.to_datetime(self.feriados_df['date'])
+        
+        # Criar dataset com todos os clientes únicos
+        todos_clientes = pd.DataFrame({'id_cliente': self.df['id_cliente'].unique()})
+        
+        # Calcular data da última compra de each cliente
+        ultima_compra = self.df.groupby('id_cliente')['date_purchase'].max().reset_index()
+        ultima_compra.columns = ['id_cliente', 'data_ultima_compra']
+        
+        # Juntar com todos os clientes
+        self.clientes_df = todos_clientes.merge(ultima_compra, on='id_cliente', how='left')
+        
+        # Calcular dias desde a última compra
+        self.clientes_df['dias_desde_ultima_compra'] = (
+            self.data_referencia - self.clientes_df['data_ultima_compra']
+        ).dt.days
+        
+        print(f"Total de clientes únicos: {len(self.clientes_df)}")
+    
+    def criar_features_com_feriados(self):
+        # Features baseadas no histórico completo de compras
+        features_comportamento = self.df.groupby('id_cliente').agg({
+            'gmv_success': ['sum', 'mean', 'count', 'max'],
+            'total_tickets_quantity_success': ['sum', 'mean', 'max'],
+            'origem_viagem_ida': 'nunique',
+            'destino_viagem_ida': 'nunique',
+            'date_purchase': ['min', 'max', 'nunique']
+        }).reset_index()
+        
+        features_comportamento.columns = [
+            'id_cliente', 'gmv_total', 'gmv_medio', 'total_compras', 'gmv_maximo',
+            'tickets_total', 'tickets_medio', 'tickets_maximo', 
+            'origens_unicas', 'destinos_unicos', 
+            'primeira_compra', 'ultima_compra', 'dias_com_compra'
+        ]
+        
+        # Calcular frequência de compra
+        features_comportamento['dias_atividade'] = (
+            features_comportamento['ultima_compra'] - features_comportamento['primeira_compra']
+        ).dt.days + 1
+        
+        features_comportamento['frequencia_compra'] = (
+            features_comportamento['total_compras'] / features_comportamento['dias_atividade']
+        ).fillna(0)
+        
+        # Calcular recência (dias desde última compra)
+        features_comportamento['recencia'] = (
+            self.data_referencia - features_comportamento['ultima_compra']
+        ).dt.days
+        
+        # Features de valor médio por compra
+        features_comportamento['valor_medio_por_ticket'] = (
+            features_comportamento['gmv_total'] / features_comportamento['tickets_total']
+        ).fillna(0)
+        
+        # Juntar com dados básicos dos clientes
+        self.features_df = self.clientes_df.merge(features_comportamento, on='id_cliente', how='left')
+        
+        # Adicionar features relacionadas a feriados
+        self._adicionar_features_feriados()
+        
+        # Preencher NaN para clientes sem histórico
+        colunas_numericas = ['gmv_total', 'gmv_medio', 'total_compras', 'tickets_total', 
+                           'tickets_medio', 'origens_unicas', 'destinos_unicos',
+                           'frequencia_compra', 'recencia', 'valor_medio_por_ticket',
+                           'compras_em_feriados', 'compras_proximas_feriados']
+        
+        for col in colunas_numericas:
+            if col in self.features_df.columns:
+                self.features_df[col] = self.features_df[col].fillna(0)
+        
+        # Criar flags para tipo de cliente
+        self.features_df['eh_novo_cliente'] = (self.features_df['total_compras'] == 1).astype(int)
+        self.features_df['eh_cliente_frequente'] = (self.features_df['total_compras'] > 1).astype(int)
+        self.features_df['eh_cliente_inativo'] = (self.features_df['recencia'] > 90).astype(int)
+        
+        print(f"Features criadas para {len(self.features_df)} clientes")
+    
+    def _adicionar_features_feriados(self):
+        # Adicionar informações de feriados às compras
+        self.df['data_compra'] = self.df['date_purchase'].dt.date
+        self.feriados_df['data_feriado'] = self.feriados_df['date'].dt.date
+        
+        # Verificar se cada compra foi em feriado
+        compras_com_feriados = self.df.merge(
+            self.feriados_df[['data_feriado', 'name']], 
+            left_on='data_compra', 
+            right_on='data_feriado', 
+            how='left'
+        )
+        
+        compras_com_feriados['compra_em_feriado'] = compras_com_feriados['data_feriado'].notna().astype(int)
+        
+        # Verificar se compra foi próxima a feriado (3 dias antes ou depois)
+        feriados_list = self.feriados_df['data_feriado'].tolist()
+        compras_com_feriados['compra_proxima_feriado'] = 0
+        
+        for feriado in feriados_list:
+            # Corrigir o cálculo de diferença de dias
+            mask = (abs((compras_com_feriados['date_purchase'] - pd.Timestamp(feriado)).dt.days) <= 3)
+            compras_com_feriados.loc[mask, 'compra_proxima_feriado'] = 1
+        
+        # Agregar por cliente
+        features_feriados = compras_com_feriados.groupby('id_cliente').agg({
+            'compra_em_feriado': 'sum',
+            'compra_proxima_feriado': 'sum'
+        }).reset_index()
+        
+        features_feriados.columns = ['id_cliente', 'compras_em_feriados', 'compras_proximas_feriados']
+        
+        # Juntar com features principais
+        self.features_df = self.features_df.merge(features_feriados, on='id_cliente', how='left')
+    
+    def criar_target_historico(self):
+        self.df = self.df.sort_values(['id_cliente', 'date_purchase'])
+        
+        # Calcular próxima compra para cada registro
+        self.df['proxima_data_compra'] = self.df.groupby('id_cliente')['date_purchase'].shift(-1)
+        self.df['dias_ate_proxima_compra'] = (
+            self.df['proxima_data_compra'] - self.df['date_purchase']
+        ).dt.days
+        
+        # Marcar se comprou nos próximos 30 dias
+        self.df['comprou_proximos_30dias'] = (
+            (self.df['dias_ate_proxima_compra'] <= self.janela_dias) & 
+            (self.df['dias_ate_proxima_compra'] > 0)
+        ).astype(int)
+        
+        # Identificar a última compra de cada cliente para validação temporal
+        ultimas_compras = self.df.groupby('id_cliente')['date_purchase'].max().reset_index()
+        ultimas_compras['eh_ultima_compra_valida'] = True
+        
+        self.df = self.df.merge(ultimas_compras, on=['id_cliente', 'date_purchase'], how='left')
+        self.df['eh_ultima_compra_valida'] = self.df['eh_ultima_compra_valida'].fillna(False)
+        
+        # Agrupar por cliente para ter uma métrica geral de propensão
+        target_historico = self.df.groupby('id_cliente').agg({
+            'comprou_proximos_30dias': 'mean'
+        }).reset_index()
+        
+        target_historico.columns = ['id_cliente', 'taxa_recompra_30d']
+        
+        # Target para validação temporal (últimas compras)
+        target_validacao = self.df[self.df['eh_ultima_compra_valida']].groupby('id_cliente').agg({
+            'comprou_proximos_30dias': 'last'
+        }).reset_index()
+        
+        target_validacao.columns = ['id_cliente', 'target_validacao']
+        
+        # Juntar com features
+        self.features_df = self.features_df.merge(target_historico, on='id_cliente', how='left')
+        self.features_df = self.features_df.merge(target_validacao, on='id_cliente', how='left')
+        
+        self.features_df['taxa_recompra_30d'] = self.features_df['taxa_recompra_30d'].fillna(0)
+        self.features_df['target_validacao'] = self.features_df['target_validacao'].fillna(0)
+        
+        print(f"Target histórico criado")
+        print(f"Clientes com target de validação: {(self.features_df['target_validacao'].notna()).sum()}")
+    
+    def treinar_modelo(self):
+        features = [
+            'total_compras', 'gmv_total', 'gmv_medio', 'tickets_total', 'tickets_medio',
+            'origens_unicas', 'destinos_unicos', 'frequencia_compra', 'recencia',
+            'valor_medio_por_ticket', 'eh_novo_cliente', 'eh_cliente_frequente', 
+            'eh_cliente_inativo', 'compras_em_feriados', 'compras_proximas_feriados'
+        ]
+        
+        # Usar taxa de recompra como target para classificação
+        df_treino = self.features_df[self.features_df['total_compras'] > 0].copy()
+        
+        if len(df_treino) == 0:
+            print("AVISO: Nenhum cliente com histórico para treino")
+            self.clf = None
+            return
+        
+        # Criar target binário: alta propensão (taxa > 0.3)
+        df_treino['alta_propensao'] = (df_treino['taxa_recompra_30d'] > 0.3).astype(int)
+        
+        X = df_treino[features]
+        y = df_treino['alta_propensao']
+        
+        print(f"Clientes com histórico: {len(df_treino)}")
+        print(f"Clientes com alta propensão: {y.sum()} ({y.mean()*100:.1f}%)")
+        
+        if y.sum() < 10:
+            print("AVISO: Poucos exemplos positivos para treino")
+            self.clf = None
+            return
+        
+        # Treinar modelo
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=42
+        )
+        
+        self.clf = RandomForestClassifier(
+            random_state=42, 
+            n_estimators=100, 
+            class_weight='balanced',
+            max_depth=8
+        )
+        self.clf.fit(X_train, y_train)
+        
+        # Avaliar no conjunto de teste
+        y_pred = self.clf.predict(X_test)
+        y_proba = self.clf.predict_proba(X_test)[:, 1]
+        
+        self.metricas_treino = {
+            'acuracia_teste': accuracy_score(y_test, y_pred),
+            'auc_teste': roc_auc_score(y_test, y_proba),
+            'precision_teste': precision_score(y_test, y_pred),
+            'recall_teste': recall_score(y_test, y_pred),
+            'f1_teste': f1_score(y_test, y_pred),
+            'n_amostras_teste': len(y_test)
+        }
+        
+        print(f"\n=== MÉTRICAS DE TREINO/TESTE ===")
+        print(f"Acurácia (teste): {self.metricas_treino['acuracia_teste']:.3f}")
+        print(f"AUC (teste): {self.metricas_treino['auc_teste']:.3f}")
+        print(f"Precision (teste): {self.metricas_treino['precision_teste']:.3f}")
+        print(f"Recall (teste): {self.metricas_treino['recall_teste']:.3f}")
+        print(f"F1-Score (teste): {self.metricas_treino['f1_teste']:.3f}")
+        
+        # Relatório de classificação detalhado
+        print("\nRelatório de Classificação (Teste):")
+        print(classification_report(y_test, y_pred))
+        
+        # Matriz de confusão
+        cm = confusion_matrix(y_test, y_pred)
+        print("Matriz de Confusão (Teste):")
+        print(f"TN: {cm[0,0]}, FP: {cm[0,1]}")
+        print(f"FN: {cm[1,0]}, TP: {cm[1,1]}")
+    
+    def validar_modelo_temporal(self):
+        """Validação temporal para calcular acurácia real"""
+        features = [
+            'total_compras', 'gmv_total', 'gmv_medio', 'tickets_total', 'tickets_medio',
+            'origens_unicas', 'destinos_unicos', 'frequencia_compra', 'recencia',
+            'valor_medio_por_ticket', 'eh_novo_cliente', 'eh_cliente_frequente', 
+            'eh_cliente_inativo', 'compras_em_feriados', 'compras_proximas_feriados'
+        ]
+        
+        # Usar apenas clientes com target de validação
+        df_validacao = self.features_df[self.features_df['target_validacao'].notna()].copy()
+        
+        if len(df_validacao) == 0:
+            print("AVISO: Nenhum dado para validação temporal")
+            return None
+        
+        X = df_validacao[features]
+        y_true = df_validacao['target_validacao']
+        
+        # Fazer previsões com o modelo treinado
+        if self.clf is not None:
+            y_pred = self.clf.predict(X)
+            y_proba = self.clf.predict_proba(X)[:, 1]
+            
+            # Calcular métricas
+            self.metricas_validacao_temporal = {
+                'acuracia_validacao_temporal': accuracy_score(y_true, y_pred),
+                'auc_validacao_temporal': roc_auc_score(y_true, y_proba),
+                'precision_validacao_temporal': precision_score(y_true, y_pred),
+                'recall_validacao_temporal': recall_score(y_true, y_pred),
+                'f1_validacao_temporal': f1_score(y_true, y_pred),
+                'n_amostras_validacao_temporal': len(df_validacao)
+            }
+            
+            print(f"\n=== VALIDAÇÃO TEMPORAL (CENÁRIO REAL) ===")
+            print(f"Amostras de validação: {self.metricas_validacao_temporal['n_amostras_validacao_temporal']}")
+            print(f"Clientes que compraram: {y_true.sum()} ({y_true.mean()*100:.1f}%)")
+            print(f"Acurácia (validação temporal): {self.metricas_validacao_temporal['acuracia_validacao_temporal']:.3f}")
+            print(f"AUC (validação temporal): {self.metricas_validacao_temporal['auc_validacao_temporal']:.3f}")
+            print(f"Precision (validação temporal): {self.metricas_validacao_temporal['precision_validacao_temporal']:.3f}")
+            print(f"Recall (validação temporal): {self.metricas_validacao_temporal['recall_validacao_temporal']:.3f}")
+            print(f"F1-Score (validação temporal): {self.metricas_validacao_temporal['f1_validacao_temporal']:.3f}")
+            
+            print(f"\nRelatório de Classificação (Validação Temporal):")
+            print(classification_report(y_true, y_pred))
+            
+            # Matriz de confusão
+            cm = confusion_matrix(y_true, y_pred)
+            print(f"Matriz de Confusão (Validação Temporal):")
+            print(f"Verdadeiros Negativos: {cm[0,0]}")
+            print(f"Falsos Positivos: {cm[0,1]}")
+            print(f"Falsos Negativos: {cm[1,0]}")
+            print(f"Verdadeiros Positivos: {cm[1,1]}")
+            
+            return self.metricas_validacao_temporal
+        
+        return None
+    
+    def fazer_previsoes(self):
+        features = [
+            'total_compras', 'gmv_total', 'gmv_medio', 'tickets_total', 'tickets_medio',
+            'origens_unicas', 'destinos_unicos', 'frequencia_compra', 'recencia',
+            'valor_medio_por_ticket', 'eh_novo_cliente', 'eh_cliente_frequente', 
+            'eh_cliente_inativo', 'compras_em_feriados', 'compras_proximas_feriados'
+        ]
+        
+        # Preencher valores missing
+        for col in features:
+            if col in self.features_df.columns:
+                self.features_df[col] = self.features_df[col].fillna(0)
+        
+        X = self.features_df[features]
+        
+        if self.clf is not None:
+            probabilidades = self.clf.predict_proba(X)[:, 1]
+            self.features_df['probabilidade_compra_30dias'] = probabilidades
+            self.features_df['previsao_compra_30dias'] = (probabilidades > 0.5).astype(int)
+        else:
+            # Fallback baseado em regras
+            self.features_df['probabilidade_compra_30dias'] = 0.1
+            self.features_df.loc[self.features_df['eh_cliente_frequente'] == 1, 'probabilidade_compra_30dias'] += 0.2
+            self.features_df.loc[self.features_df['recencia'] <= 30, 'probabilidade_compra_30dias'] += 0.3
+            self.features_df['probabilidade_compra_30dias'] = np.clip(
+                self.features_df['probabilidade_compra_30dias'], 0.01, 0.9
+            )
+            self.features_df['previsao_compra_30dias'] = (
+                self.features_df['probabilidade_compra_30dias'] > 0.5
+            ).astype(int)
+        
+        # Estimar dias até próxima compra
+        self.features_df['dias_ate_proxima_compra_previsto'] = np.where(
+            self.features_df['previsao_compra_30dias'] == 1,
+            np.clip(self.features_df['recencia'] * 0.7, 7, 90),
+            999
+        )
+        
+        # Calcular data prevista
+        self.features_df['data_proxima_compra_prevista'] = (
+            self.data_referencia + 
+            pd.to_timedelta(self.features_df['dias_ate_proxima_compra_previsto'], unit='D')
+        )
+        
+        print(f"Previsões realizadas para {len(self.features_df)} clientes")
+    
+    def recomendar_trechos(self):
+        # Recomendar trecho mais frequente para cada cliente
+        trechos_frequentes = self.df.groupby(
+            ['id_cliente', 'origem_viagem_ida', 'destino_viagem_ida']
+        ).size().reset_index(name='frequencia')
+        
+        idx = trechos_frequentes.groupby('id_cliente')['frequencia'].idxmax()
+        recomendacoes = trechos_frequentes.loc[idx, ['id_cliente', 'origem_viagem_ida', 'destino_viagem_ida']]
+        recomendacoes.columns = ['id_cliente', 'origem_recomendada', 'destino_recomendado']
+        
+        self.features_df = self.features_df.merge(recomendacoes, on='id_cliente', how='left')
+        
+        # Para clientes sem histórico, recomendar trechos populares
+        trechos_populares = self.df.groupby(['origem_viagem_ida', 'destino_viagem_ida']).size().nlargest(5).reset_index()
+        if len(trechos_populares) > 0:
+            trecho_default = trechos_populares.iloc[0]
+            self.features_df['origem_recomendada'] = self.features_df['origem_recomendada'].fillna(trecho_default['origem_viagem_ida'])
+            self.features_df['destino_recomendado'] = self.features_df['destino_recomendado'].fillna(trecho_default['destino_viagem_ida'])
+        
+        print("Recomendações de trechos criadas")
+    
+    def salvar_resultados(self):
+        # Selecionar colunas relevantes
+        cols = [
+            'id_cliente', 'data_ultima_compra', 'dias_desde_ultima_compra',
+            'total_compras', 'gmv_total', 'frequencia_compra', 'recencia',
+            'previsao_compra_30dias', 'probabilidade_compra_30dias',
+            'dias_ate_proxima_compra_previsto', 'data_proxima_compra_prevista',
+            'origem_recomendada', 'destino_recomendado',
+            'compras_em_feriados', 'compras_proximas_feriados'
+        ]
+        
+        df_final = self.features_df[cols].copy()
+        df_final['previsao_compra_30dias'] = df_final['previsao_compra_30dias'].map({0: 'Não', 1: 'Sim'})
+        df_final['probabilidade_compra_30dias'] = (df_final['probabilidade_compra_30dias'] * 100).round(1)
+        
+        # Ordenar por probabilidade decrescente
+        df_final = df_final.sort_values('probabilidade_compra_30dias', ascending=False)
+        
+        # Salvar no S3
+        output_path = f"s3://{self.bucket_s3}/powerbi/previsao_compras_clientes.csv"
+        wr.s3.to_csv(df_final, output_path, index=False)
+        
+        # Salvar métricas de performance
+        metricas_path = f"s3://{self.bucket_s3}/powerbi/metricas_modelo.csv"
+        
+        # Combinar ambas as métricas
+        todas_metricas = {**self.metricas_treino, **self.metricas_validacao_temporal}
+        metricas_df = pd.DataFrame([todas_metricas])
+        wr.s3.to_csv(metricas_df, metricas_path, index=False)
+        
+        # Estatísticas finais
+        compradores = df_final[df_final['previsao_compra_30dias'] == 'Sim']
+        print(f"\n=== RESULTADOS FINAIS ===")
+        print(f"Total de clientes: {len(df_final):,}")
+        print(f"Clientes previstos para comprar: {len(compradores):,} ({len(compradores)/len(df_final)*100:.1f}%)")
+        
+        if len(compradores) > 0:
+            dias_medio = compradores['dias_ate_proxima_compra_previsto'].mean()
+            prob_media = compradores['probabilidade_compra_30dias'].mean()
+            print(f"Probabilidade média: {prob_media:.1f}%")
+            print(f"Dias médios até próxima compra: {dias_medio:.1f} dias")
+            print(f"Data média prevista: {(self.data_referencia + timedelta(days=dias_medio)).strftime('%Y-%m-%d')}")
+        
+        # Mostrar métricas do modelo
+        print(f"\n=== MÉTRICAS DO MODELO ===")
+        print("Métricas de Treino/Teste:")
+        for metrica, valor in self.metricas_treino.items():
+            if 'teste' in metrica:
+                print(f"  {metrica}: {valor:.3f}")
+        
+        print("\nMétricas de Validação Temporal:")
+        for metrica, valor in self.metricas_validacao_temporal.items():
+            if 'validacao_temporal' in metrica:
+                print(f"  {metrica}: {valor:.3f}")
+        
+        print(f"\nResultados salvos em: {output_path}")
+        print(f"Métricas salvas em: {metricas_path}")
+    
+    def executar(self):
+        print("Iniciando pipeline de previsão de compras...")
+        print(f"Data de referência: {self.data_referencia.strftime('%Y-%m-%d')}")
+        print(f"Janela de previsão: {self.janela_dias} dias\n")
+        
+        print("1. Carregando dados...")
+        self.carregar_dados()
+        
+        print("2. Pré-processando...")
+        self.preprocessar()
+        
+        print("3. Criando features...")
+        self.criar_features_com_feriados()
+        
+        print("4. Criando target histórico...")
+        self.criar_target_historico()
+        
+        print("5. Treinando modelo...")
+        self.treinar_modelo()
+        
+        print("6. Validando modelo temporalmente...")
+        self.validar_modelo_temporal()
+        
+        print("7. Fazendo previsões...")
+        self.fazer_previsoes()
+        
+        print("8. Recomendando trechos...")
+        self.recomendar_trechos()
+        
+        print("9. Salvando resultados...")
+        self.salvar_resultados()
+        
+        print("\nPipeline concluído com sucesso!")
+
+if __name__ == "__main__":
+    pipeline = PrevisaoComprasClientes(bucket_s3="challenge-cognitio")
+    pipeline.executar()

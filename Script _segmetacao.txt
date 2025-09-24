@@ -1,0 +1,262 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import awswrangler as wr
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
+class SegmentacaoClientes:
+    def __init__(self, bucket_s3: str, data_referencia: str = "2024-04-02"):
+        self.bucket_s3 = bucket_s3
+        self.df = None
+        self.feriados = None
+        self.caracteristicas_clientes = None
+        self.data_referencia = pd.to_datetime(data_referencia)
+
+    def carregar_dados(self):
+        query_viagens = """
+        SELECT 
+            date_purchase,
+            gmv_success,
+            total_tickets_quantity_success,
+            origem_viagem_ida,
+            destino_viagem_ida,
+            id_cliente
+        FROM db_cognitio_clickbus.tb_viagens_clickbusprocessed 
+        WHERE cast(date_purchase AS date) >= date '2022-01-01'
+        """
+
+        self.df = wr.athena.read_sql_query(
+            sql=query_viagens,
+            database="db_cognitio_clickbus",
+            s3_output=f"s3://{self.bucket_s3}/temp-query/",
+            ctas_approach=False
+        )
+        
+        query_feriados = """
+        SELECT 
+            date,
+            type
+        FROM db_cognitio_clickbus.tb_feriados_brasildados_api_eventos
+        WHERE type = 'national' AND cast(date AS date) >= date '2022-01-01'
+        """
+
+        self.feriados = wr.athena.read_sql_query(
+            sql=query_feriados,
+            database="db_cognitio_clickbus",
+            s3_output=f"s3://{self.bucket_s3}/temp-query-feriados/",
+            ctas_approach=False
+        )
+
+    def preprocessar_dados(self):
+        self.df['data_compra'] = pd.to_datetime(self.df['date_purchase'])
+        self.feriados['date'] = pd.to_datetime(self.feriados['date'])
+        self.df['eh_feriado'] = self.df['data_compra'].isin(self.feriados['date']).astype(int)
+
+    def criar_caracteristicas_clientes(self):
+        agrup = {
+            'gmv_success': ['sum', 'mean', 'count'],
+            'total_tickets_quantity_success': 'sum',
+            'data_compra': ['min', 'max'],
+            'origem_viagem_ida': 'nunique',
+            'destino_viagem_ida': 'nunique',
+            'eh_feriado': 'sum'
+        }
+        df_agg = self.df.groupby('id_cliente').agg(agrup)
+        df_agg.columns = ['gmv_total', 'ticket_medio', 'quantidade_compras',
+                          'total_bilhetes', 'primeira_compra', 'ultima_compra',
+                          'origens_unicas', 'destinos_unicos', 'compras_feriados']
+
+        # Cálculo da recência usando a data de referência fixa (02/04/2024)
+        df_agg['recencia'] = (self.data_referencia - df_agg['ultima_compra']).dt.days
+        df_agg['tempo_cliente'] = (df_agg['ultima_compra'] - df_agg['primeira_compra']).dt.days
+        
+        # Permitir tempo_cliente = 0 (apenas uma compra)
+        df_agg['tempo_cliente'] = df_agg['tempo_cliente'].fillna(0)
+        df_agg.loc[df_agg['tempo_cliente'] < 0, 'tempo_cliente'] = 0
+
+        df_agg['proporcao_feriados'] = (df_agg['compras_feriados'] / df_agg['quantidade_compras']).fillna(0)
+        
+        # Evitar divisão por zero para tempo_cliente = 0
+        df_agg['frequencia_media'] = np.where(
+            df_agg['tempo_cliente'] > 0,
+            df_agg['quantidade_compras'] / df_agg['tempo_cliente'],
+            0  # Para clientes com apenas uma compra
+        )
+
+        self.caracteristicas_clientes = df_agg.reset_index()
+
+    def criar_segmentos_rfm(self):
+        df = self.caracteristicas_clientes.copy()
+        
+        # Criar pontuações RFM com tratamento de erros
+        for coluna, nome in [('recencia', 'r'), ('quantidade_compras', 'f'), ('gmv_total', 'm')]:
+            try:
+                df[f'pontuacao_{nome}'] = pd.qcut(df[coluna], 5, labels=False, duplicates='drop') + 1
+            except:
+                df[f'pontuacao_{nome}'] = pd.cut(df[coluna], 5, labels=False) + 1
+        
+        # Criar score RFM combinado
+        df['pontuacao_rfm'] = (
+            df['pontuacao_r'].astype(str) + 
+            df['pontuacao_f'].astype(str) + 
+            df['pontuacao_m'].astype(str)
+        )
+        
+        # Mapeamento RFM simplificado
+        mapeamento_rfm = {
+            '555': 'Campeoes', '554': 'Campeoes', '545': 'Campeoes', '455': 'Campeoes',
+            '544': 'Clientes_Leais', '454': 'Clientes_Leais', '445': 'Clientes_Leais',
+            '543': 'Potenciais_Leais', '534': 'Potenciais_Leais',
+            '433': 'Precisam_Atencao', '434': 'Precisam_Atencao',
+            '333': 'Novos_Clientes', '323': 'Novos_Clientes',
+            '222': 'Promissores', '223': 'Promissores',
+            '111': 'Hibernantes', '112': 'Hibernantes',
+            '311': 'Em_Risco', '312': 'Em_Risco'
+        }
+        
+        # Aplicar mapeamento
+        df['segmento_rfm'] = df['pontuacao_rfm'].map(mapeamento_rfm).fillna('Outros')
+        
+        # Atualizar características dos clientes
+        for col in ['pontuacao_r', 'pontuacao_f', 'pontuacao_m', 'pontuacao_rfm', 'segmento_rfm']:
+            self.caracteristicas_clientes[col] = df[col]
+
+    def criar_clusters(self):
+        features = ['recencia', 'quantidade_compras', 'gmv_total', 'destinos_unicos', 
+                   'frequencia_media', 'proporcao_feriados']
+        
+        # Preencher valores NaN antes do clustering
+        df_cluster = self.caracteristicas_clientes[features].copy()
+        
+        # Preencher valores faltantes com a mediana
+        for col in features:
+            if df_cluster[col].isna().any():
+                df_cluster[col] = df_cluster[col].fillna(df_cluster[col].median())
+        
+        if len(df_cluster) < 100:
+            print("Dados insuficientes para clusterização")
+            self.caracteristicas_clientes['cluster'] = 0
+            self.caracteristicas_clientes['nome_cluster'] = 'Todos_Clientes'
+            return
+        
+        # Usar todos os dados para clusterização (sem amostragem)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(df_cluster)
+
+        # Determinar número ótimo de clusters
+        try:
+            kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+            clusters = kmeans.fit_predict(X_scaled)
+            
+            # Nomear os clusters
+            nomes_clusters = {
+                0: 'Viajantes_Regulares',
+                1: 'Executivos_Frequentes', 
+                2: 'Turistas_Alto_Valor',
+                3: 'Novos_Viajantes',
+                4: 'Commuters_Leais'
+            }
+            
+            # Atribuir clusters e nomes para TODOS os clientes
+            self.caracteristicas_clientes['cluster'] = clusters
+            self.caracteristicas_clientes['nome_cluster'] = self.caracteristicas_clientes['cluster'].map(nomes_clusters)
+            
+        except Exception as e:
+            print(f"Erro na clusterização: {e}")
+            self.caracteristicas_clientes['cluster'] = 0
+            self.caracteristicas_clientes['nome_cluster'] = 'Todos_Clientes'
+
+    def calcular_acuracia(self):
+        features = ['quantidade_compras', 'destinos_unicos', 'ticket_medio', 
+                   'origens_unicas', 'proporcao_feriados', 'recencia', 'frequencia_media']
+        
+        df = self.caracteristicas_clientes[features + ['gmv_total']].dropna()
+        
+        if len(df) < 100:
+            print("Dados insuficientes para cálculo de acurácia")
+            return 0
+
+        # Criar target binário (alto valor vs baixo valor)
+        limiar = df['gmv_total'].quantile(0.75)
+        y = (df['gmv_total'] > limiar).astype(int)
+        X = df[features]
+
+        if len(y.unique()) < 2:
+            print("Target não tem variação suficiente")
+            return 0
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
+        )
+
+        modelo = RandomForestClassifier(n_estimators=50, random_state=42, max_depth=5)
+        modelo.fit(X_train, y_train)
+        y_pred = modelo.predict(X_test)
+
+        acuracia = accuracy_score(y_test, y_pred)
+        print(f"Acurácia: {acuracia:.3f}")
+        print("Relatório de classificação:")
+        print(classification_report(y_test, y_pred))
+
+        return acuracia
+
+    def salvar_resultados(self):
+        # Selecionar colunas importantes para exportação
+        cols = [
+            'id_cliente', 'gmv_total', 'ticket_medio', 'quantidade_compras',
+            'total_bilhetes', 'recencia', 'origens_unicas',
+            'destinos_unicos', 'proporcao_feriados', 'frequencia_media',
+            'pontuacao_r', 'pontuacao_f', 'pontuacao_m', 'pontuacao_rfm',
+            'segmento_rfm', 'cluster', 'nome_cluster'
+        ]
+        
+        # Filtrar colunas que existem no dataframe
+        cols_existentes = [col for col in cols if col in self.caracteristicas_clientes.columns]
+        resultados = self.caracteristicas_clientes[cols_existentes].copy()
+        
+        resultados['data_processamento'] = datetime.now()
+        resultados['data_referencia'] = self.data_referencia
+    
+        # Salvar apenas como CSV
+        path_csv = f"s3://{self.bucket_s3}/powerbi/segmentacao_clientes/resultado_segmentacao.csv"
+        
+        wr.s3.to_csv(
+            df=resultados,
+            path=path_csv,
+            index=False
+        )
+    
+        print(f"Arquivo CSV salvo em: {path_csv}")
+        
+        return path_csv
+
+    def executar(self):
+        self.carregar_dados()
+        self.preprocessar_dados()
+        self.criar_caracteristicas_clientes()
+        self.criar_segmentos_rfm()
+        self.criar_clusters()
+        acuracia = self.calcular_acuracia()
+        s3_path = self.salvar_resultados()
+        
+        print(f"\nPipeline concluído. Acurácia: {acuracia:.3f}")
+        
+        # Resumo estatístico
+        print("\nResumo da segmentação RFM:")
+        print(self.caracteristicas_clientes['segmento_rfm'].value_counts())
+        print("\nResumo dos clusters:")
+        print(self.caracteristicas_clientes['nome_cluster'].value_counts())
+        
+        return self.caracteristicas_clientes
+
+if __name__ == "__main__":
+    # Data de referência fixada como 02/04/2024 para cálculo correto da recência
+    segmentador = SegmentacaoClientes(
+        bucket_s3="challenge-cognitio",
+        data_referencia="2024-04-02"
+    )
+    resultados = segmentador.executar()
